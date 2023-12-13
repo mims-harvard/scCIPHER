@@ -1,0 +1,173 @@
+---
+title: CELLxGENE Dataset Integration
+subtitle: Ayush Noori
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include = FALSE}
+# knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Dependencies
+
+Load requisite packages and define directories. This script currently requires 1.5 days to run.
+
+```{r load-packages, message=FALSE, warning=FALSE}
+# data manipulation
+library(data.table)
+library(purrr)
+library(magrittr)
+
+# relative file paths
+library(here)
+
+# sparse matrices
+library(Matrix)
+
+# load Seurat
+library(SeuratObject)
+library(Seurat)
+
+# load human reference data for gene ID mapping
+# library(org.Hs.eg.db)
+
+# load supplemental Seurat packages
+# remotes::install_github("mojaveazure/seurat-disk")
+# library(SeuratDisk)
+
+# load CELLxGENE package
+# install.packages("devtools")
+# devtools::install_github("chanzuckerberg/cellxgene-census/api/r/cellxgene.census")
+# library(cellxgene.census)
+```
+
+Note that directories are relative to the R project path.
+
+```{r define-directores}
+# set directories
+neuroKG_dir = here("Data", "NeuroKG")
+data_dir = here("Data", "CELLxGENE")
+cellxgene_dir = "/n/data1/hms/dbmi/zitnik/lab/datasets/2023-05-CELLxGENE/census"
+cellxgene_data = "/n/data1/hms/dbmi/zitnik/lab/users/an252/NeuroKG/neuroKG/Data/CELLxGENE"
+```
+
+# Read scRNA-seq Data
+
+The CZ CELLxGENE Discover Census provides efficient computational tooling to access, query, and analyze all single-cell RNA data from [CZ CELLxGENE Discover](https://cellxgene.cziscience.com/). First, read data parsed by `2_CELLxGENE_chunk_by_group.py`.
+
+```{r list-files}
+# list files
+seurat_files = list.files(file.path(cellxgene_data, "seurat_objects"),  pattern = "_seurat.RDS$")
+group_ids = map_chr(seurat_files, ~paste(strsplit(.x, "_")[[1]][1:3], collapse = "_")) %>%
+  unique()
+
+# read nervous metadata
+nervous_groups = fread(file.path(cellxgene_data, "nervous_groups.csv")) %>%
+  .[order(-cell_counts), ]
+
+# construct integration table
+integration_groups = nervous_groups %>%
+  .[group_id != "0002771_4023040_c2876b1b-06d8-4d96-a56b-5304f815b99a"] %>%
+  .[, .N, by = .(tissue, tissue_ontology_term_id, cell_type, cell_type_ontology_term_id)] %>%
+  .[order(-N), ]
+
+```
+
+Iterate through (`tissue`, `cell_type`) combinations in order of decreasing chunk number.
+
+```{r parse-data}
+# iterate across rows
+for (i in 1:nrow(integration_groups)) {
+  
+  ### GROUP ID
+  # get (tissue, cell_type) combination; e.g., i = 30
+  tissue = integration_groups[i, tissue]
+  tissue_id = integration_groups[i, tissue_ontology_term_id]
+  cell_type = integration_groups[i, cell_type]
+  cell_type_id = integration_groups[i, cell_type_ontology_term_id]
+  n_datasets = integration_groups[i, N]
+  
+  # subset group files
+  dataset_info = nervous_groups[tissue_ontology_term_id == tissue_id & cell_type_ontology_term_id == cell_type_id]
+  group_ids = dataset_info[, group_id]
+  
+  start_time = Sys.time()
+  message("Starting integration ", i, " out of ", nrow(integration_groups), " at ", format(start_time, "%H:%M on %m/%d."))
+  message(" - Tissue: ", tissue, "\n - Cell Type: ", cell_type, "\n - Number of Datasets: ", n_datasets)
+  
+  
+  ### CONSTRUCT DIGITAL GENE EXPRESSION MATRIX
+  dataset_files = list.files(file.path(cellxgene_data, "seurat_objects"))
+  pattern = paste0(group_ids, ".*_seurat\\.RDS")
+  seurat_files = map_chr(pattern, ~grep(.x, dataset_files, value = TRUE))
+  
+  # iterate over chunks
+  message("Total ", length(seurat_files), " Seurat objects to integrate.")
+  
+  if (length(seurat_files) > 1) {
+  
+    # define function to iterate over files
+    get_seurat = function(seurat_file, seurat_index) {
+      
+      # get chunk file path; e.g., seurat_index = 1
+      # seurat_file = seurat_files[seurat_index]
+      
+      # read chunk file
+      message("Opening Seurat object ", seurat_index, ".")
+      seurat_obj = readRDS(file.path(cellxgene_data, "seurat_objects", seurat_file))
+      seurat_size = format(object.size(seurat_obj), units = "Gb", digits = 4)
+      message("Finished reading Seurat object ", seurat_index, " of size ", seurat_size, ".")
+      
+      # finding high variable genes
+      message("Identifying high variable genes.")
+      seurat_obj = FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+      
+      # garbage clean and return
+      gc()
+      return(seurat_obj)
+      
+    }
+    
+    # get Seurat files
+    seurat_objs = imap(seurat_files, get_seurat)
+    names(seurat_objs) = group_ids
+    
+    # run garbage collection
+    # gc()
+    
+    # find integration anchors
+    message("Identifying integration anchors.")
+    anchors = FindIntegrationAnchors(object.list = seurat_objs, anchor.features = 2000)
+    
+    # integrate data
+    message("Integrating data.")
+    seurat_integrated = IntegrateData(anchorset = anchors)
+    
+    # switch to integrated assay
+    # variable features of this assay are automatically set during IntegrateData
+    DefaultAssay(seurat_integrated) = "integrated"
+
+  
+  } else {
+    
+    # read chunk file
+    message("Opening only Seurat object, no integration.")
+    seurat_integrated = readRDS(file.path(cellxgene_data, "seurat_objects", seurat_files))
+    seurat_size = format(object.size(seurat_integrated), units = "Gb", digits = 4)
+    message("Finished reading Seurat object of size ", seurat_size, ".")
+    
+    # finding high variable genes
+    message("Identifying high variable genes.")
+    seurat_integrated = FindVariableFeatures(seurat_integrated, selection.method = "vst", nfeatures = 2000)
+    
+  }
+  
+  # scale data
+  seurat_integrated = ScaleData(seurat_integrated)
+  seurat_integrated = RunPCA(seurat_integrated)
+  
+}
+```
+
+

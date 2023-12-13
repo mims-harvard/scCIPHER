@@ -1,0 +1,2 @@
+# UBERON
+The [UBERON](http://obophenotype.github.io/uberon/) multi-species anatomy ontology was downloaded from [GitHub](https://github.com/obophenotype/uberon/releases) and browsed at [EMBL-EBI](https://www.ebi.ac.uk/ols/ontologies/uberon). Specifically, `nervous-minimal.obo`, which contains the nervous system subset of UBERON, was downloaded from [v2023-01-09](https://github.com/obophenotype/uberon/tree/v2023-01-09) (21fb179).

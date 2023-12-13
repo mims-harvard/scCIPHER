@@ -1,0 +1,247 @@
+---
+title: Filter Knowledge Graph
+subtitle: Ayush Noori
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include = FALSE}
+# knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Dependencies
+
+Load requisite packages and define directories. Note that this script may also use my personal utilities package `brainstorm`, which can be downloaded via `devtools::install_github("ayushnoori/brainstorm")`.
+
+```{r load-packages, message=FALSE, warning=FALSE}
+# data manipulation
+library(data.table)
+library(purrr)
+library(magrittr)
+
+# relative file paths
+library(here)
+
+# data visualization
+library(ggplot2)
+
+# ontology processing
+library(ontologyIndex)
+library(stringr)
+
+# utility functions
+library(brainstorm)
+```
+
+To copy the knowledge graph from the PrimeKG project to the relevant directory of the NeuroKG project on O2, run the following lines.
+
+```{bash copy-kg}
+cp -r /n/data1/hms/dbmi/zitnik/lab/users/an252/PrimeKG/datasets/data/kg /n/data1/hms/dbmi/zitnik/lab/users/an252/NeuroKG/neuroKG/Data/PrimeKG
+```
+
+Note that directories are relative to the R project path.
+
+```{r define-directores}
+# set directories
+primeKG_dir = here("Data", "PrimeKG")
+HPA_dir = here("Data", "HPA")
+uberon_dir = here("Data", "UBERON")
+neuroKG_dir = here("Data", "NeuroKG")
+```
+
+# Load Original PrimeKG
+
+Data downloaded from [Harvard Dataverse](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/IXA7BM). Specifically, the following command was used:
+
+```{bash get-primekg, eval = FALSE}
+# wget -O README.txt https://dataverse.harvard.edu/api/access/datafile/6191270
+# wget -O kg.csv https://dataverse.harvard.edu/api/access/datafile/6180620
+# wget -O nodes.tab https://dataverse.harvard.edu/api/access/datafile/6180617
+# wget -O drug_features.tab https://dataverse.harvard.edu/api/access/datafile/6180619
+# wget -O disease_features.tab https://dataverse.harvard.edu/api/access/datafile/6180618
+```
+
+Load PrimeKG knowledge graph.
+
+```{r load-data}
+# load KG
+original_primeKG_nodes = here(primeKG_dir, "original", "nodes.tab") %>% fread() %>% suppressWarnings()
+original_primeKG_edges = fread(here(primeKG_dir, "original", "kg.csv"))
+
+# print node types
+message("Original PrimeKG Nodes:\t", nrow(original_primeKG_nodes))
+message("Original PrimeKG Edges:\t", nrow(original_primeKG_edges) / 2)
+```
+
+# Load Updated PrimeKG
+
+The updated July 2023 version of PrimeKG was saved in `Data/PrimeKG/updated`. Briefly, the following steps were followed from the PrimeKG paper:
+> We merged the harmonized primary data resources into a graph. We integrated the various processed, curated datasets and cleaned the graph by dropping NaN and duplicate edges, adding reverse edges, dropping duplicates again, and removing self-loops. This version of the knowledge graph is available in PrimeKG’s repository as ‘kg_raw.csv’.
+
+Note that the version of the graph _before_ taking the largest connected component (LCC) was used, since subsequent scripts add additional nodes to the graph (*e.g.*, informed by single-cell RNA-seq data). Here, the LCC is taken as the final step before the data split.
+
+```{r load-primekG}
+# load edges of updated PrimeKG
+primeKG_edges = fread(here(primeKG_dir, "kg", "auxiliary", "kg_raw.csv"))
+
+# construct node matrix
+primeKG_nodes = primeKG_edges %>%
+  .[, .(x_id, x_type, x_name, x_source)] %>%
+  unique()
+colnames(primeKG_nodes) = gsub("x", "node", colnames(primeKG_nodes))
+
+# make indices
+primeKG_nodes[, node_index := 1:nrow(primeKG_nodes) - 1]
+setcolorder(primeKG_nodes, "node_index")
+
+# add indices to edges
+primeKG_nodes %>% .[, node_string := paste(node_id, node_name, node_source, sep = "_")] %>%
+  .[, x_index := node_index] %>%
+  .[, y_index := node_index]
+primeKG_edges %>%
+  .[, x_string := paste(x_id, x_name, x_source, sep = "_")] %>%
+  .[, y_string := paste(y_id, y_name, y_source, sep = "_")]
+
+# merge back to edges
+primeKG_edges = merge(primeKG_edges, primeKG_nodes[, .(node_string, x_index)], by.x = "x_string", by.y = "node_string", sort = F)
+primeKG_edges = merge(primeKG_edges, primeKG_nodes[, .(node_string, y_index)], by.x = "y_string", by.y = "node_string", sort = F)
+
+# drop merge columns
+primeKG_nodes %>%
+  .[, node_string := NULL] %>%
+  .[, x_index := NULL] %>%
+  .[, y_index := NULL]
+primeKG_edges %>%
+  .[, x_string := NULL] %>%
+  .[, y_string := NULL]
+setcolorder(primeKG_edges, c("relation", "display_relation", "x_index", "x_id", "x_type", "x_name", "x_source", "y_index", "y_id", "y_type", "y_name", "y_source"))
+
+# print node types
+message("Updated PrimeKG Nodes:\t", nrow(primeKG_nodes))
+message("Updated PrimeKG Edges:\t", nrow(primeKG_edges) / 2)
+```
+
+Generate summary tables for the updated PrimeKG.
+
+```{r primeKG-tables}
+# generate node summary
+original_node_types = original_primeKG_nodes[, .N, by = "node_type"]
+updated_node_types = primeKG_nodes[, .N, by = "node_type"]
+
+# generate edge summary
+original_edge_types = original_primeKG_edges[, .N, by = "relation"][, N := N/2]
+updated_edge_types = primeKG_edges[, .N, by = "relation"][, N := N/2]
+
+# update column names
+colnames(original_node_types) = paste(colnames(original_node_types), "original", sep = "_")
+colnames(original_edge_types) = paste(colnames(original_edge_types), "original", sep = "_")
+colnames(updated_node_types) = paste(colnames(updated_node_types), "updated", sep = "_")
+colnames(updated_edge_types) = paste(colnames(updated_edge_types), "updated", sep = "_")
+
+# merge node summary
+node_type_comp = merge(original_node_types, updated_node_types, by.x = "node_type_original", by.y = "node_type_updated", all = T) %>%
+  .[, difference := N_updated - N_original] %>%
+  .[order(-abs(difference)), ] %>%
+  setnames("node_type_original", "node_type")
+  
+# merge edge summary
+edge_type_comp = merge(original_edge_types, updated_edge_types, by.x = "relation_original", by.y = "relation_updated", all = T)  %>%
+  .[, difference := N_updated - N_original] %>%
+  .[order(-abs(difference)), ] %>%
+  setnames("relation_original", "edge_type")
+
+# save comparison tables
+fwrite(node_type_comp, here(neuroKG_dir, "1_filter_KG", "original_vs_updated_primeKG_nodes.csv"))
+fwrite(edge_type_comp, here(neuroKG_dir, "1_filter_KG", "original_vs_updated_primeKG_edges.csv"))
+```
+
+# Generate Brain PPI
+
+This step filters nodes and edges for genes/proteins expressed in the brain using data from the Human Protein Atlas. Since we add single-cell data later, we exclude this step - however, the code is provided for reference.
+
+```{r read-hpa}
+# # read HPA brain expression data
+# brain_genes = fread(here(HPA_dir, "brain_genes.tsv"))
+# brain_region_genes = fread(here(HPA_dir, "brain_region_genes.tsv"))
+# 
+# # save and remove PrimeKG gene/protein nodes
+# primeKG_nodes_gene = primeKG_nodes[node_type == "gene/protein"]
+# primeKG_nodes = primeKG_nodes[node_type != "gene/protein"]
+# 
+# # filter for brain genes
+# primeKG_nodes_gene_brain = primeKG_nodes_gene[node_name %in% brain_genes$Gene]
+# 
+# # print number of nodes
+# message("Original Gene/Protein Nodes:\t", nrow(primeKG_nodes_gene))
+# message("Filtered Gene/Protein Nodes:\t", nrow(primeKG_nodes_gene_brain))
+```
+
+# Filter Anatomy Terms
+
+Save and remove PrimeKG anatomy nodes.
+
+```{r get-anatomy}
+# save and remove PrimeKG anatomy nodes
+primeKG_nodes_anatomy = primeKG_nodes[node_type == "anatomy"]
+primeKG_nodes = primeKG_nodes[node_type != "anatomy"]
+```
+
+Read UBERON atlas.
+
+```{r read-uberon}
+# read nervous system subset of UBERON ontology
+uberon_nervous = get_ontology(here(uberon_dir, "nervous-minimal.obo"))
+
+# get nervous system IDs in PrimeKG format
+# remove UBERON tag and leading zeroes
+uberon_nervous_IDs = uberon_nervous$id %>%
+  gsub("UBERON:", "", ., fixed = T) %>%
+  str_remove("^0+")
+
+# set names
+names(uberon_nervous_IDs) = uberon_nervous$name
+
+# check intersection
+# find terms not included in PrimeKG
+uberon_primeKG = uberon_nervous_IDs %in% primeKG_nodes_anatomy$node_id
+uberon_not_included = uberon_nervous_IDs[!uberon_primeKG] %>%
+  {data.table(Name = names(.), ID = .)}
+summary(uberon_primeKG)
+```
+
+Filter anatomy terms for those included in PrimeKG.
+
+```{r filter-anatomy}
+# save and remove PrimeKG anatomy nodes
+primeKG_nodes_anatomy_nervous = primeKG_nodes_anatomy %>%
+  .[node_id %in% uberon_nervous_IDs]
+
+# print number of nodes
+message("Original Anatomy Nodes:\t", nrow(primeKG_nodes_anatomy))
+message("Filtered Anatomy Nodes:\t", nrow(primeKG_nodes_anatomy_nervous))
+```
+
+# Construct NeuroKG
+
+Construct NeuroKG by combining filtered tables.
+
+```{r combine-tables}
+# combine node tables
+# neuroKG_nodes = rbind(primeKG_nodes, primeKG_nodes_gene_brain, primeKG_nodes_anatomy_nervous)
+neuroKG_nodes = rbind(primeKG_nodes, primeKG_nodes_anatomy_nervous)
+
+# remove PrimeKG edges not included
+neuroKG_edges = primeKG_edges[(x_index %in% neuroKG_nodes$node_index) & (y_index %in% neuroKG_nodes$node_index)]
+
+# print number of nodes and edges
+message("NeuroKG Nodes:\t", nrow(neuroKG_nodes))
+message("NeuroKG Edges:\t", nrow(neuroKG_edges) / 2)
+
+# save to file, note only been filtered for brain expression and anatomy
+saveRDS(neuroKG_nodes, here(neuroKG_dir, "1_filter_KG", "neuroKG_nodes.RDS"))
+saveRDS(neuroKG_edges, here(neuroKG_dir, "1_filter_KG", "neuroKG_edges.RDS"))
+```

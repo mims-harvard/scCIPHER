@@ -1,0 +1,187 @@
+---
+title: Visualize Knowledge Graph
+subtitle: Ayush Noori
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Dependencies
+
+Load requisite packages and define directories.
+
+```{r load-packages, message=FALSE, warning=FALSE}
+# data manipulation
+library(data.table)
+library(purrr)
+library(magrittr)
+
+# relative file paths
+library(here)
+
+# data visualization
+library(ggplot2)
+
+# graph analysis
+library(igraph)
+```
+
+Note that directories are relative to the R project path.
+
+```{r define-directores}
+# set directories
+primeKG_dir = here("Data", "PrimeKG")
+neuroKG_dir = here("Data", "NeuroKG")
+out_dir = here(neuroKG_dir, "4_visualize_KG")
+figures_dir = here("Results", "figures")
+```
+
+# Read Data
+
+```{r read-neurokg}
+# read NeuroKG with cell type nodes
+neuroKG_nodes = readRDS(here(neuroKG_dir, "3_harmonize_KG", "neuroKG_nodes.RDS"))
+neuroKG_edges = readRDS(here(neuroKG_dir, "3_harmonize_KG", "neuroKG_edges.RDS"))
+ 
+# print original node counts
+message("Nodes in NeuroKG: ", nrow(neuroKG_nodes))
+message("Edges in NeuroKG: ", nrow(neuroKG_edges))
+```
+
+```{r generate-graph}
+# graph libraries
+library(igraph)
+library(ggplot2)
+library(ggnetwork)
+
+# get fill colors
+light_colors = c("#e2cfc4","#f7d9c4","#faedcb","#c9e4de","#c6def1","#dbcdf0","#f2c6de","#f9c6c9")
+dark_colors = c("#5e4f47","#70513d","#75653c","#485f59","#40586b","#514469","#6d3e57","#753a40")
+i = 8
+
+g = erdos.renyi.game(17, 0.3, type = "gnp")
+g_net = ggnetwork(g, layout = layout_with_kk(g))
+g_p = ggplot(g_net, aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_edges(linewidth = 0.8, alpha = 0.8, color = dark_colors[i]) + 
+  geom_nodes(size = 7, fill = light_colors[i], color = dark_colors[i], shape = 21, stroke = 1) +
+  theme_blank()
+
+ggsave(file.path(figures_dir, paste0("Graph ", i, ".svg")), g_p, width = 3, height = 3)
+```
+
+Read results of analyses in `visualize_results.ipynb`. Read from and write results to a temporary folder.
+
+```{r read-alz-repurposing}
+
+# read similarities
+alz_repurposing = fread(here(figures_dir, "alzheimer_repurposing_predictions.csv"))
+
+# merge with drug features
+alz_rp_ft = merge(drug_features, alz_repurposing, by = "node_index", all = T)
+
+# get approved drugs
+alz_rp_ft_approved = alz_rp_ft[grepl("approved", group)] %>%
+  .[order(-aggregate_prediction)]
+
+# add rank
+alz_rp_ft_approved[, rank := 1:nrow(alz_rp_ft_approved)]
+
+# subset for brain or neuro or alzheimer
+brain_approved = alz_rp_ft_approved[grepl("(brain)|(neuro)|(Alzheimer)", mechanism_of_action)]
+
+```
+
+Read results of other similarity analyses.
+
+```{r read-sims}
+# read neuro-non-neuro similarities
+neuro_sims = fread(here(figures_dir, "neuro_disease_similarity.csv"))
+
+# read alzheimer vs. non-alzheimer similarities
+alz_sims = fread(here(figures_dir, "alz_similarity.csv"))
+
+# read neurodegeneration similarities
+nd_sims = fread(here(figures_dir, "neurodegen_similarity.csv"))
+```
+
+Plot neurodegeneration similarity.
+
+```{r neurodegen-sim}
+# compute delta
+nd_sims[, delta := neurodegen_similarity - random_similarity]
+setcolorder(nd_sims, "delta")
+
+# cast wide to long
+nd_sims_wide = melt(nd_sims, id.vars = colnames(nd_sims)[1:6], variable.name = "similarity_type", value.name = "similarity")
+nd_sims_wide[, similarity_type := factor(similarity_type, levels = c("random_similarity", "neurodegen_similarity"), labels = c("Random Disease", "Neurodegenerative Disease"))]
+
+# make plot
+p = ggplot(nd_sims_wide, aes(x = similarity, group = similarity_type, fill = similarity_type)) +
+  geom_histogram(color = "black") +
+  scale_y_continuous(expand = expansion(c(0, 0.05))) +
+  scale_fill_manual(values = c("#FFCAAF", "#96C5F7")) +
+  labs(x = "Similarity", y = "Count", fill = "Comparison") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold", size = 14),
+    legend.title = element_text(face = "bold", size = 14),
+    legend.text = element_text(size = 11),
+    legend.position = "bottom"
+  )
+
+# save results
+ggsave(here(figures_dir, "neurodegen_similarity.svg"), p, width = 6, height = 4)
+ggsave(here(figures_dir, "neurodegen_similarity.png"), p, width = 6, height = 4, dpi = 900)
+```
+
+Plot top 5 with paired barplot.
+
+```{r top-5}
+# truncate character vector using str_trunc from stringr
+nd_sims_wide[, node_name := map_chr(nd_sims_wide$node_name, ~str_trunc(.x, width = 50))]
+
+# # order nd_sims_wide
+# nd_sims_wide_order = nd_sims_wide[order(similarity), ] %>% 
+#   .[similarity_type == "Neurodegenerative Disease", node_name]
+
+nd_sims_wide_order = nd_sims_wide[order(delta), ] %>%
+  .[similarity_type == "Neurodegenerative Disease", node_name]
+
+# relabel factor
+nd_sims_wide = nd_sims_wide[, node_name := factor(node_name, levels = make.unique(nd_sims_wide_order), labels = nd_sims_wide_order)]
+
+# exclude diseases not in the top 20
+top_20_diseases = nd_sims_wide[order(-node_name), ][1:40, node_name]
+nd_sims_wide_filtered = nd_sims_wide[node_name %in% top_20_diseases]
+```
+
+Make plot.
+
+```{r make-plot}
+# make plot
+p_bar = ggplot(nd_sims_wide_filtered, aes(y = node_name, x= similarity, group = similarity_type, fill = similarity_type)) +
+  geom_bar(color = "black", stat = "identity", position = "dodge", linewidth = 0.2) +
+  scale_x_continuous(expand = expansion(c(0, 0.05))) +
+  scale_fill_manual(values = c("#FFCAAF", "#96C5F7")) +
+  labs(x = "Similarity", y = "Disease", fill = "Comparison") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold", size = 14),
+    legend.title = element_text(face = "bold", size = 14),
+    legend.text = element_text(size = 11),
+    legend.position = "bottom"
+  )
+
+# save results
+ggsave(here(figures_dir, "neurodegen_similarity_individual.svg"), p_bar, width = 6, height = 6)
+ggsave(here(figures_dir, "neurodegen_similarity_individual.png"), p_bar, width = 6, height = 6, dpi = 900)
+```

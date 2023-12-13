@@ -1,0 +1,346 @@
+---
+title: CELLxGENE Seurat Analysis by Cell Type
+subtitle: Ayush Noori
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include = FALSE}
+# knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Dependencies
+
+Load requisite packages and define directories. This script currently requires 1.5 days to run.
+
+```{r load-packages, message=FALSE, warning=FALSE}
+# data manipulation
+library(data.table)
+library(purrr)
+library(magrittr)
+
+# relative file paths
+library(here)
+
+# sparse matrices
+library(Matrix)
+
+# load Seurat
+library(Seurat)
+library(limma)
+
+# load human reference data for gene ID mapping
+# library(org.Hs.eg.db)
+
+# load supplemental Seurat packages
+# remotes::install_github("mojaveazure/seurat-disk")
+# library(SeuratDisk)
+
+# load CELLxGENE package
+# install.packages("devtools")
+# devtools::install_github("chanzuckerberg/cellxgene-census/api/r/cellxgene.census")
+# library(cellxgene.census)
+```
+
+Note that directories are relative to the R project path.
+
+```{r define-directores}
+# set directories
+neuroKG_dir = here("Data", "NeuroKG")
+ensembl_dir = here("Data", "Ensembl")
+data_dir = here("Data", "CELLxGENE")
+cellxgene_dir = "/n/data1/hms/dbmi/zitnik/lab/datasets/2023-05-CELLxGENE/census"
+cellxgene_data = "/n/data1/hms/dbmi/zitnik/lab/users/an252/NeuroKG/neuroKG/Data/CELLxGENE"
+
+# # sink output
+# current_time = Sys.time()
+# file_path = here("Results", "RStudio", paste0("seurat_analysis_", format(current_time, "%m_%d_%H_%M_%S"), ".txt"))
+# file_conn = file(file_path, "w")
+# sink(file = file_conn, type = "message")
+```
+
+# Read Protein Coding Genes
+
+Instead of filtering for only NeuroKG genes, filter for all protein coding genes.
+
+```{r read-neuroKG}
+# # read NeuroKG nodes, not edges
+# neuroKG_nodes = fread(here(neuroKG_dir, "4_final_KG", "neuroKG_nodes.csv"))
+# # neuroKG_edges = fread(here(neuroKG_dir, "4_final_KG", "neuroKG_edges.csv"))
+# 
+# # map NeuroKG from ENTREZ to Ensembl IDs
+# neuroKG_genes = neuroKG_nodes[node_type == "gene/protein"]
+# neuroKG_ensembl = mapIds(org.Hs.eg.db, neuroKG_genes$node_id, "ENSEMBL", "ENTREZID", multiVals = "list") %>%
+#   unlist() %>%
+#   .[!is.na(.)]
+# 
+# # check for NA values
+# # neuroKG_genes[node_id %in% names(neuroKG_ensembl)[is.na(neuroKG_ensembl)]]
+```
+
+Read protein coding genes from Ensembl, see `Data/Ensembl/README.md` for documentation on data retrieval steps.
+
+```{r read-genes}
+# read protein coding genes and fix names
+# match content enclosed in parentheses (plus preceding space), then match one or more spaces
+mart = fread(here(ensembl_dir, "mart_export.txt"))
+colnames(mart) = colnames(mart) %>% tolower() %>% gsub("\\s\\([^)]+\\)", "", .) %>% gsub("\\s+" , "_", .)
+
+# filter for protein coding genes that also have Entrez IDs
+protein_coding = mart %>%
+  .[gene_type == "protein_coding"] %>%
+  .[, c("gene_synonym", "transcript_stable_id", "protein_stable_id", "gene_stable_id_version", "protein_stable_id_version", "transcript_stable_id_version") := NULL] %>%
+  unique() %>%
+  .[!is.na(ncbi_gene_id)]
+
+# collapse protein coding by Ensembl ID
+protein_coding = protein_coding[, lapply(.SD, function(x) paste(unique(x), collapse = ", ")), by = gene_stable_id]
+
+# get unique protein coding Ensembl IDs
+protein_coding_ensembl = unique(protein_coding$gene_stable_id)
+
+# print number of genes
+message("Number of Protein Coding Genes: ", length(protein_coding_ensembl))
+```
+
+# Read scRNA-seq Data
+
+The CZ CELLxGENE Discover Census provides efficient computational tooling to access, query, and analyze all single-cell RNA data from [CZ CELLxGENE Discover](https://cellxgene.cziscience.com/). First, read data parsed by `2_CELLxGENE_chunk_by_group.py`.
+
+```{r list-files}
+# list files
+all_files = list.files(file.path(cellxgene_data, "chunks"),  pattern = "_matrix.csv$")
+group_ids = map_chr(all_files, ~paste(strsplit(.x, "_")[[1]][1:3], collapse = "_")) %>%
+  unique()
+
+# read nervous metadata
+nervous_groups = fread(file.path(cellxgene_data, "nervous_groups.csv")) %>%
+  .[order(-cell_counts), ]
+
+# list number of subset cells
+message("Total Cells: ", nervous_groups[group_id %in% group_ids, sum(cell_counts)])
+```
+
+Get number of chunks per dataset.
+
+```{r count-chunks}
+all_files = list.files(file.path(cellxgene_data, "chunks"))
+
+for (i in 1:nrow(nervous_groups)) {
+  
+  ### GROUP ID
+  group_id = nervous_groups[i, group_id]
+  pattern = paste0(group_id, ".*_matrix\\.csv")
+  chunk_files = grep(pattern, all_files, value = TRUE)
+  n_chunks = length(chunk_files)
+  nervous_groups[i, number_chunks := n_chunks]
+  
+}
+
+# remove row with large number of chunks
+nervous_groups = nervous_groups[-which(number_chunks == 29)]
+
+# order by increasing cell count
+nervous_groups = nervous_groups[order(cell_counts)]
+```
+
+Iterate through (`tissue`, `cell_type`, `dataset_id`) combinations in order of decreasing total cell count.
+
+```{r parse-data}
+# iterate across rows
+for (i in 1:nrow(nervous_groups)) {
+  
+  
+  ### GROUP ID
+  # get (tissue, cell_type, dataset_id) combination; e.g., i = 1
+  tissue = nervous_groups[i, tissue]
+  cell_type = nervous_groups[i, cell_type]
+  dataset_id = nervous_groups[i, dataset_id]
+  group_id = nervous_groups[i, group_id]
+  cell_count = nervous_groups[i, cell_counts]
+  start_time = Sys.time()
+  message("\n\nANALYSIS ", i, "/",  nrow(nervous_groups), ":")
+  message("Starting analysis ", i, " out of ", nrow(nervous_groups), " at ", format(start_time, "%H:%M on %m/%d."))
+  message(" - Tissue: ", tissue, "\n - Cell Type: ", cell_type, "\n - Dataset ID: ", dataset_id, "\n - Cell Count: ", cell_count)
+  
+  ### CELL AND GENE METADATA
+  # read cell and gene metadata
+  obs_cell_metadata = fread(file.path(cellxgene_data, "chunks", paste0(group_id, "_obs.csv")))
+  var_gene_metadata = fread(file.path(cellxgene_data, "chunks", paste0(group_id, "_var.csv")))
+  
+  # filter gene metadata by NeuroKG genes, also keep mitochondrial genes
+  # var_gene_metadata = var_gene_metadata[grepl("^MT-", feature_name) | feature_id %in% neuroKG_ensembl, ]
+  
+  # get MT genes to drop later
+  # mt_genes_to_drop = var_gene_metadata[!(feature_id %in% neuroKG_ensembl)]
+  
+  # filter gene metadata by protein coding genes, also keep mitochondrial genes
+  var_gene_metadata = var_gene_metadata[grepl("^MT-", feature_name) | feature_id %in% protein_coding_ensembl, ]
+  
+  
+  ### CONSTRUCT DIGITAL GENE EXPRESSION MATRIX
+  all_files = list.files(file.path(cellxgene_data, "chunks"))
+  # pattern = paste0(group_id, ".*_adata\\.h5ad")
+  pattern = paste0(group_id, ".*_matrix\\.csv")
+  chunk_files = grep(pattern, all_files, value = TRUE)
+  
+  # create data table to store digital gene expression matrix (DGE)
+  # i.e., gene x cell table; check tables() to see all tables in memory
+  dge = data.table()
+  
+  # iterate over chunks
+  message("Total ", length(chunk_files), " chunks to read.")
+  for (chunk_index in 1:length(chunk_files)) {
+    
+    # get chunk file path; e.g., chunk_index = 1
+    chunk_file = chunk_files[chunk_index]
+    
+    # read chunk file
+    message("Opening chunk ", chunk_index, ".")
+    chunk = fread(file.path(cellxgene_data, "chunks", chunk_file))
+    chunk = chunk[soma_dim_1 %in% var_gene_metadata$soma_joinid, ]
+    chunk_size = format(object.size(chunk), units = "Gb", digits = 4)
+    message("Finished reading chunk ", chunk_index, " of size ", chunk_size, ".")
+    
+    # append to DGE
+    gc()
+    dge = rbind(dge, chunk)
+    gc()
+    
+  }
+  
+  # run garbage collection
+  remove(chunk)
+  gc()
+  
+  # get number of genes and cells
+  n_genes = nrow(var_gene_metadata)
+  n_cells = nrow(obs_cell_metadata)
+  message("- Number of cells: ", n_cells)
+  message("- Number of genes: ", n_genes)
+  message("- Assay: ", unique(obs_cell_metadata$assay))
+  
+  # convert cell IDs to indices
+  soma_to_cell_index = 1:n_cells
+  names(soma_to_cell_index) = obs_cell_metadata$soma_joinid
+  message("Remapping cell indices.")
+  dge[, cell_index := soma_to_cell_index[as.character(soma_dim_0)]]
+  
+  # convert gene IDs to indices
+  soma_to_gene_index = 1:n_genes
+  names(soma_to_gene_index) = var_gene_metadata$soma_joinid
+  message("Remapping gene indices.")
+  dge[, gene_index := soma_to_gene_index[as.character(soma_dim_1)]]
+  
+  # add to cell and gene metadata
+  obs_cell_metadata[, cell_index := soma_to_cell_index]
+  var_gene_metadata[, gene_index := soma_to_gene_index]
+  setcolorder(obs_cell_metadata, "cell_index")
+  setcolorder(var_gene_metadata, "gene_index")
+  rownames(obs_cell_metadata) = obs_cell_metadata$soma_joinid
+  rownames(var_gene_metadata) = var_gene_metadata$soma_joinid
+  
+  # construct sparse expression matrix
+  # i: rows are genes, dge$gene_index (since not zero-indexed and filtered)
+  # j: columns are cells, cell_index
+  # x: nonzero values are expression counts, soma_data
+  message("Converting to sparse matrix.")
+  expr_mat = sparseMatrix(i = dge$gene_index, j = dge$cell_index, x = dge$soma_data, dims = c(n_genes, n_cells))
+  dimnames(expr_mat) = list(var_gene_metadata$soma_joinid, obs_cell_metadata$soma_joinid)
+  remove(dge)
+  
+  # construct Seurat object
+  message("Creating Seurat object.")
+  seurat_obj = CreateSeuratObject(expr_mat, project = group_id, meta.data = obs_cell_metadata, row.names = var_gene_metadata$soma_joinid)
+  remove(expr_mat)
+  gc()
+  
+  # add metadata
+  seurat_obj[["RNA"]] = AddMetaData(seurat_obj[["RNA"]], var_gene_metadata)
+  
+  # low-quality or dying cells often exhibit extensive mitochondrial contamination
+  # filter cells that have > 5% mitochondrial counts
+  # see line 1164 in https://github.com/satijalab/seurat/blob/HEAD/R/utilities.R
+  # rownames(seurat_obj[["RNA"]])
+  message("Filtering cells with mitochondrial contamination.")
+  MT_features = as.character(var_gene_metadata[grepl("^MT-", feature_name), soma_joinid])
+  message("- Total ", length(MT_features), " mitochondrial genes.")
+  seurat_obj = PercentageFeatureSet(seurat_obj, features = MT_features, col.name = "percent_MT")
+  MT_cell_count = sum(seurat_obj@meta.data$percent_MT >= 5)
+  message("- Removed ", MT_cell_count, "/", ncol(seurat_obj), " cells.")
+  seurat_obj = subset(seurat_obj, subset = percent_MT < 5)
+  
+  # visualize QC metrics as a violin plot
+  # VlnPlot(seurat_obj, features = c("nFeature_RNA", "nCount_RNA"), ncol = 2)
+  
+  # we use global-scaling normalization method “LogNormalize” that normalizes the feature expression measurements
+  # for each cell by the total expression, multiplies this by a scale factor (10,000 by default), and
+  # log-transforms the result
+  message("Normalizing data.")
+  seurat_obj = NormalizeData(seurat_obj, normalization.method = "LogNormalize", scale.factor = 10000)
+  
+  # calculate row-wise total expression and variance
+  gene_sums = rowSums(seurat_obj@assays$RNA@data)
+  gene_var = apply(seurat_obj@assays$RNA@data, 1, var)
+  sum_quantiles = quantile(gene_sums) # probs = seq(0, 1, 0.1)
+  var_quantiles = quantile(gene_var)
+  
+  # find highly expressed genes with low variance across cells
+  high_expr_genes = gene_sums > sum_quantiles[4] 
+  # (gene_sums > sum_quantiles[4]) & (gene_var < var_quantiles[4])
+  high_expr_genes = seurat_obj@assays$RNA@meta.features[high_expr_genes, ]  %>%
+      merge(protein_coding, ., by.x = "gene_stable_id", by.y = "feature_id", all.x = F, all.y = T)
+  
+  # find highly variable features
+  message("Identifying variable features.")
+  seurat_obj = FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+  
+  # scale variable features
+  seurat_obj = ScaleData(seurat_obj)
+  
+  # run PCA on variable features
+  seurat_obj = RunPCA(seurat_obj)
+  
+  # find neighbors and get clusters
+  seurat_obj = FindNeighbors(seurat_obj)
+  seurat_obj = FindClusters(seurat_obj, resolution = 0.1)
+  n_clusters = length(levels(Idents(seurat_obj)))
+  
+  # if needed, try higher resolution
+  if(n_clusters <= 1) {
+    seurat_obj = FindClusters(seurat_obj, resolution = 0.3)
+    n_clusters = length(levels(Idents(seurat_obj)))
+  }
+  
+  # if clusters were identified
+  if(n_clusters > 1) {
+    
+    # get cluster markers and merge with metadata
+    cluster_markers = FindAllMarkers(seurat_obj)
+    cluster_markers = as.data.table(cluster_markers)[, gene := as.numeric(gene)]
+    cluster_markers = merge(var_gene_metadata, cluster_markers, by.x = "soma_joinid", by.y = "gene", all.x = F, all.y = T) %>%
+      merge(protein_coding, ., by.x = "gene_stable_id", by.y = "feature_id", all.x = F, all.y = T) %>%
+      .[order(cluster, -avg_log2FC)]
+    
+    # write cluster markers to file
+    fwrite(cluster_markers, file.path(cellxgene_data, "seurat_objects_V2", paste0(group_id, "_clusters.csv")))
+      
+  }
+  
+  # save Seurat object
+  message("Saving Seurat object to disk.")
+  saveRDS(seurat_obj, file.path(cellxgene_data, "seurat_objects_V2", paste0(group_id, "_seurat.RDS")))
+  end_time = Sys.time()
+  message("Seurat object saved.")
+  end_time = Sys.time()
+  message("Completed analysis ", i, " out of ", nrow(nervous_groups), " at ", format(end_time, "%H:%M on %m/%d."))
+  time_diff = difftime(end_time, start_time, units = "secs")
+  message("Took ", round(time_diff, digits = 1), " seconds.")
+  
+}
+message("All datasets analyzed!")
+
+# # close sink
+# sink()
+# close(file_conn)
+```

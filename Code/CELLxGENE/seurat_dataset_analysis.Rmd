@@ -1,0 +1,176 @@
+---
+title: CELLxGENE Seurat Analysis by Dataset
+subtitle: Ayush Noori
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include = FALSE}
+# knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Dependencies
+
+Load requisite packages and define directories. This script currently requires 1.5 days to run.
+
+```{r load-packages, message=FALSE, warning=FALSE}
+# data manipulation
+library(data.table)
+library(purrr)
+library(magrittr)
+
+# relative file paths
+library(here)
+
+# sparse matrices
+library(Matrix)
+
+# load Seurat
+library(Seurat)
+library(limma)
+
+# load human reference data for gene ID mapping
+# library(org.Hs.eg.db)
+
+# load supplemental Seurat packages
+# remotes::install_github("mojaveazure/seurat-disk")
+# library(SeuratDisk)
+
+# load CELLxGENE package
+# install.packages("devtools")
+# devtools::install_github("chanzuckerberg/cellxgene-census/api/r/cellxgene.census")
+# library(cellxgene.census)
+```
+
+Note that directories are relative to the R project path.
+
+```{r define-directores}
+# set directories
+neuroKG_dir = here("Data", "NeuroKG")
+ensembl_dir = here("Data", "Ensembl")
+data_dir = here("Data", "CELLxGENE")
+cellxgene_dir = "/n/data1/hms/dbmi/zitnik/lab/datasets/2023-05-CELLxGENE/census"
+cellxgene_data = "/n/data1/hms/dbmi/zitnik/lab/users/an252/NeuroKG/neuroKG/Data/CELLxGENE"
+```
+
+# Read Protein Coding Genes
+
+Instead of filtering for only NeuroKG genes, filter for all protein coding genes. Read protein coding genes from Ensembl, see `Data/Ensembl/README.md` for documentation on data retrieval steps.
+
+```{r read-genes}
+# read protein coding genes and fix names
+# match content enclosed in parentheses (plus preceding space), then match one or more spaces
+mart = fread(here(ensembl_dir, "mart_export.txt"))
+colnames(mart) = colnames(mart) %>% tolower() %>% gsub("\\s\\([^)]+\\)", "", .) %>% gsub("\\s+" , "_", .)
+
+# filter for protein coding genes that also have Entrez IDs
+protein_coding = mart %>%
+  .[gene_type == "protein_coding"] %>%
+  .[, c("gene_synonym", "transcript_stable_id", "protein_stable_id", "gene_stable_id_version", "protein_stable_id_version", "transcript_stable_id_version") := NULL] %>%
+  unique() %>%
+  .[!is.na(ncbi_gene_id)]
+
+# collapse protein coding by Ensembl ID
+protein_coding = protein_coding[, lapply(.SD, function(x) paste(unique(x), collapse = ", ")), by = gene_stable_id]
+
+# get unique protein coding Ensembl IDs
+protein_coding_ensembl = unique(protein_coding$gene_stable_id)
+
+# print number of genes
+message("Number of Protein Coding Genes: ", length(protein_coding_ensembl))
+```
+
+# Read scRNA-seq Data
+
+The CZ CELLxGENE Discover Census provides efficient computational tooling to access, query, and analyze all single-cell RNA data from [CZ CELLxGENE Discover](https://cellxgene.cziscience.com/). First, read data parsed by `2_CELLxGENE_chunk_by_group.py`.
+
+```{r list-files}
+# list files
+all_files = list.files(file.path(cellxgene_data, "chunks"),  pattern = "_matrix.csv$")
+group_ids = map_chr(all_files, ~paste(strsplit(.x, "_")[[1]][1:3], collapse = "_")) %>%
+  unique()
+
+# read nervous metadata
+nervous_groups = fread(file.path(cellxgene_data, "nervous_groups.csv")) %>%
+  .[order(-cell_counts), ]
+
+# list number of subset cells
+message("Total Cells: ", nervous_groups[group_id %in% group_ids, sum(cell_counts)])
+```
+
+Get number of chunks per dataset.
+
+```{r count-chunks}
+all_files = list.files(file.path(cellxgene_data, "chunks"))
+
+for (i in 1:nrow(nervous_groups)) {
+  
+  ### GROUP ID
+  group_id = nervous_groups[i, group_id]
+  pattern = paste0(group_id, ".*_matrix\\.csv")
+  chunk_files = grep(pattern, all_files, value = TRUE)
+  n_chunks = length(chunk_files)
+  nervous_groups[i, number_chunks := n_chunks]
+  
+}
+
+# remove row with large number of chunks
+# nervous_groups = nervous_groups[-which(number_chunks == 29)]
+
+# order by increasing cell count
+nervous_groups = nervous_groups[order(cell_counts)]
+```
+
+Group by dataset to iterate across datasets.
+
+```{r group-dataset}
+# group by dataset
+nervous_datasets = nervous_groups %>% 
+  .[, .(dataset_id, soma_joinid, collection_id, collection_name, collection_doi, dataset_title, dataset_h5ad_path, dataset_total_cell_count)] %>%
+  unique()
+
+# add aggregated metadata
+grp = function(x) paste(unique(x), collapse = ", ")
+nervous_datasets_agg = nervous_groups %>%
+  .[, .(tissue = grp(tissue), tissue_ontology_term_id = grp(tissue_ontology_term_id),
+        cell_type = grp(cell_type), cell_type_ontology_term_id = grp(cell_type_ontology_term_id),
+        cell_counts = sum(cell_counts), number_chunks = sum(number_chunks),
+        number_tissue = length(unique(tissue_ontology_term_id)),
+        number_cell_types = length(unique(cell_type_ontology_term_id))), by = dataset_id]
+
+# merge nervous data
+nervous_datasets = merge(nervous_datasets, nervous_datasets_agg, by = "dataset_id") %>%
+  .[order(-cell_counts)]
+
+# write to file
+# fwrite(nervous_datasets, file.path(cellxgene_data, "nervous_datasets.csv"))
+```
+
+Iterate through (`tissue`, `cell_type`, `dataset_id`) combinations in order of decreasing total cell count.
+
+```{r parse-data}
+# iterate across rows
+for (i in 1:nrow(nervous_datasets)) {
+  
+  ### DATASET ID
+  # get information per dataset; e.g., i = 1
+  dataset_id_i = nervous_datasets[i, dataset_id]
+  tissues = nervous_groups[dataset_id == dataset_id_i, tissue]
+  cell_types = nervous_groups[dataset_id == dataset_id_i, cell_type]
+  group_ids = nervous_groups[dataset_id == dataset_id_i, group_id]
+  
+  # dataset-level statistics
+  n_cells = nervous_datasets[i, cell_counts]
+  n_chunks = nervous_datasets[i, number_chunks]
+  n_tissue = nervous_datasets[i, number_tissue]
+  
+  # message
+  start_time = Sys.time()
+  message("\n\nANALYSIS ", i, "/",  nrow(nervous_datasets), ":")
+  message("Starting analysis ", i, " out of ", nrow(nervous_datasets), " at ", 
+          format(start_time, "%H:%M on %m/%d."))
+  message(" - Tissue: ", tissue, "\n - Cell Type: ", cell_type, "\n - Dataset ID: ", dataset_id, "\n - Cell Count: ", cell_count)
+  
+}
+message("All datasets analyzed!")
+```

@@ -1,0 +1,29 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.DS_Store
+*/.DS_Store
+
+# ignore Python cache
+__pycache__
+.ipynb_checkpoints
+
+# ignore files in Data subdirectories
+Data/*/*
+
+# unignore README files with .md extensions
+!Data/*/README.md
+!Data/Ensembl/mart_attributes.png
+
+# ignore files in Results subdirectories
+Results/*/*
+
+# unignore README files with .md extensions
+!Results/*/README.md
+!Results/CELLxGENE/neuron_markers.png
+!Results/CELLxGENE/non_neuron_markers.png
+
+# ignore virtual environment
+# to activate, run source neuroKG/bin/activate
+scCIPHER_env/
